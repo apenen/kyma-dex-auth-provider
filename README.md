@@ -2,6 +2,8 @@
 
 This script helps cluster users to auto-update kyma token to their configuration/cache.
 
+Only works with gitlab authentication using username/password. TODO: Login with email/password of internal dex.
+
 This script uses kubectl command to add kyma cluster kubeconfig to your kubectl configuration file
 
 If no context is specified, use kubectl config current-context.
