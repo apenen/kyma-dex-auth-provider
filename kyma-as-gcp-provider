@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+####################################
+###### Kyma As GCP Provider ########
+####################################
+
+import argparse
+import configparser
+import datetime
+import json
+import jwt
+import keyring
+import os
+import re
+import requests
+import secrets
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import urllib
+import yaml
+
+from datetime import datetime, timezone
+from getpass import getpass
+from lxml import html
+
+class CatchSigint(object):
+    '''SIGINT Capture'''
+
+    def __init__(self):
+        self.caught_sigint = False
+        self.oldsigint = None
+
+    def note_sigint(self, _signum, _frame):
+        '''Note SIGINT'''
+        sys.stdout.write(" SINGINT received! Ending current job...")
+        sys.stdout.flush()
+        self.caught_sigint = True
+
+    def __enter__(self):
+        self.oldsigint = signal.signal(signal.SIGINT, self.note_sigint)
+        return self
+
+    def __exit__(self, *args):
+        signal.signal(signal.SIGINT, self.oldsigint)
+
+    def __call__(self):
+        return self.caught_sigint
+
+def me(item):
+
+    if item == 'basename': 
+        return os.path.basename(__file__)
+    if item == 'realpath':
+        return os.path.realpath(__file__)
+    if item == 'filename':
+        return os.path.splitext(os.path.basename(__file__))[0]
+
+    return None
+
+def password_get_set(context, username, password=None):
+    global passwd
+
+    try:
+        passwd
+    except NameError:
+        passwd = None
+
+    if password:
+        passwd = password
+
+    if not passwd:
+        passwd = keyring_get_save(context, username)
+
+    return passwd
+
+def kubectl_config(arguments, ignore_error=False):
+    
+    if not shutil.which('kubectl'):
+        raise SystemExit('kubectl not found!')
+
+    command = "kubectl config %s" % arguments
+    try:
+        result = subprocess.run(command.split(" "), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if result.returncode != 0 and not ignore_error:
+            raise SystemExit(result.stderr)
+    except Exception as e:
+        raise SystemError(e)
+
+    return result
+
+def kubeconfig_save(name, kubeconfig):
+    cluster = [ cl['cluster'] for cl in kubeconfig['clusters'] if cl['name'] == name ]
+    context = [ co['context'] for co in kubeconfig['contexts'] if co['name'] == name ]
+    user = [ us['user'] for us in kubeconfig['users'] if us['name'] == name ]
+    
+    #Config cluster
+    kubectl_config('unset clusters.%s' % name)
+    kubectl_config('set clusters.%s.server %s' % (name, cluster[0]['server']))
+    kubectl_config('set clusters.%s.certificate-authority-data %s' % (name, cluster[0]['certificate-authority-data']))
+
+    #Config context
+    kubectl_config('unset contexts.%s' % name)
+    kubectl_config('set contexts.%s.cluster %s' % (name, context[0]['cluster']))
+    kubectl_config('set contexts.%s.user %s' % (name, context[0]['user']))
+
+    #Config user
+    kubectl_config('unset users.%s' % name)
+    for i in user[0]['auth-provider']['config']:
+        command = 'set-credentials %s --auth-provider gcp --auth-provider-arg=%s=%s' % (name, i, user[0]['auth-provider']['config'][i])
+        kubectl_config(command)
+
+    return
+
+def keyring_get_save(context, id, password=None):
+
+    if not password:
+        try:
+            password = keyring.get_password(context , id)
+        except Exception as e:
+            raise SystemError(e)
+    else:
+        try:
+            keyring.set_password(context, id, password)
+            print('Password saved in keyring.')
+        except Exception as e:
+            raise SystemError(e)
+
+    return password
+
+def hostname_resolves(hostname):
+    try:
+        socket.gethostbyname(hostname.replace('https://',''))
+        return True
+    except socket.error:
+        return False
+
+def location_parse(location):
+    from urllib.parse import urlparse, parse_qs
+    result = {}
+
+    l = urlparse(location)
+
+    result['url'] = l._replace(query=None)._replace(fragment=None).geturl()
+    result['scheme'] = l.scheme
+    result['hostname'] = l.hostname
+    result['port'] = l.port
+    result['path'] = l.path
+    result['query'] = parse_qs(l.query)
+    result['fragment'] = parse_qs(l.fragment)
+
+    return result
+
+def args_parse():
+    parser = argparse.ArgumentParser(description='Generate Kyma token for use in kubectl.\n \
+    This script use ~/.config/%s/config for configuration store.\n \
+    If configuration file is empty, arguments loads it!\n \
+    If the username is changed and password is not previously saved, this will ask for password.' % me('basename'), formatter_class=argparse.RawTextHelpFormatter)
+
+    parser.add_argument('-c', '--context', help='context to use (default current-context)', dest='context')
+    parser.add_argument('-f', '--filename', help='%s configuration file to load' % me('filename'), dest='filename', default=None)
+    parser.add_argument('--format', choices=['json', 'yaml'], help='output format (json, yaml)', dest='format', default='json')
+    parser.add_argument('-l', '--login', choices=[ 'gitlab' ], help='login system to use', dest='login', default='gitlab')
+    parser.add_argument('-u', '--username', '--user', help='username to login in', dest='username', default=None)
+    parser.add_argument('-p', '--password', '--pass', help='prompt for new password', dest='password', action='store_true', default=False)
+    parser.add_argument('-s', '--save', help='save %s login credentials' % me('filename'), dest='save', action='store_true', default=False)
+    
+    kubectl_group_parser = parser.add_argument_group('kubectl')
+    kubectl_group_parser.add_argument('-k', '--kubeconfig', help='save kubeconfig from kyma', dest='kubeconfig', action='store_true', default=False)
+    kubectl_group_parser.add_argument('--kubectl', help='kubectl bin path to use', dest='kubectl', default='kubectl')
+
+    kyma_group_parser = parser.add_argument_group('kyma')
+    kyma_group_parser.add_argument('--dex', help='dex url', dest='dex', default=None)
+    kyma_group_parser.add_argument('--console', help='console url', dest='console', default=None)
+    kyma_group_parser.add_argument('--configurations-generator', help='configurations generator url', dest='configurations_generator', default=None )
+    
+    return parser.parse_args()
+
+def context_get_set(args=None, current=False):
+    global context
+
+    try:
+        context
+    except NameError:
+        context = None
+
+    if not context:
+        if args.context:
+            context = args.context
+        else:
+            currentcontext= kubectl_config('current-context', ignore_error=True)
+            if currentcontext.returncode == 0:
+                context = currentcontext.stdout.rstrip()
+    
+    return context
+
+def config_file(args):
+    if args.filename:
+        filename = args.filename
+    else:
+        filename = os.path.join(os.path.expanduser("~"), '.config', me('filename'), 'config')
+
+    return filename
+
+def config_parse(args):
+
+    password = None
+    save = False
+
+    filename = config_file(args)
+
+    context = context_get_set(args)
+
+    config = config_load_save(filename)
+
+    if not context and not args.context:
+        raise SystemExit('No current-context where found. Specify context!')
+
+    if context not in config:
+        save = True
+        config[context] = {}
+        config[context]['login'] = args.login
+
+    if args.username:
+        config[context]['username'] = args.username
+    
+    if 'username' in config[context]:
+        password = password_get_set(context, config[context]['username'])
+        
+        if args.password or not password:
+            password = getpass('Password/secret of %s for %s (%s): ' % (config[context]['login'], context, config[context]['username']))
+            if password != getpass('Confirm password/secret of %s for %s (%s): ' % (config[context]['login'], context, config[context]['username'])):
+                raise SystemExit('Password/secret mismatch!')
+            else:
+                password = password_get_set(context, config[context]['username'], password)
+                keyring_get_save(context, config[context]['username'], password)
+
+    if args.dex:
+        config[context]['dex'] = args.dex
+    
+    if args.console:
+        config[context]['console'] = args.console
+    
+    if args.configurations_generator:
+        config[context]['configurations-generator'] = args.configurations_generator
+
+    if config[context]['login'] == 'gitlab':
+        if 'username' not in config[context]:
+            raise SystemExit('User required for %s login!' % config[context]['login'])
+
+        if not password:
+            raise SystemExit('Password required for %s login!' % config[context]['login'])
+    
+    # Define and test url's:
+    if not 'dex' in config[context]:
+        config[context]['dex'] = 'https://dex.%s' % context
+    if not hostname_resolves(config[context]['dex']):
+        raise SystemExit('Unable to resolve dex dns %s. Is Kyma installed?' % config[context]['dex'].replace('https://', ''))
+
+    if not 'console' in config[context]:
+        config[context]['console'] = 'https://console.%s' % context
+    if not hostname_resolves(config[context]['console']):
+        raise SystemExit('Unable to resolve console dns %s. Is Kyma installed?' % config[context]['console'].replace('https://', ''))
+    
+    if not 'configurations-generator' in config[context]:
+        config[context]['configurations-generator'] = 'https://configurations-generator.%s' % context
+    if not hostname_resolves(config[context]['configurations-generator']):
+        raise SystemExit('Unable to resolve configurations-generator dns %s. Is Kyma installed?' % config[context]['configurations-generator'].replace('https://', ''))
+
+    if not 'format' in config[context]:
+        config[context]['format'] = args.format
+
+    if args.save or save:
+        if 'last_use' in config[context]:
+            #Removed old use
+            config.remove_option(context, 'last_use')
+        config[context]['modificated'] = datetime.now(timezone.utc).astimezone().isoformat()
+        config_load_save(filename, config)
+        if args.save:
+            raise SystemExit('Configuration updated!')
+
+    return config
+
+def config_load_save(filename, config=None):
+    if not config:
+        config = configparser.ConfigParser()
+        try:
+            config.read(filename)
+        except Exception as e:
+            raise SystemError(e)
+
+        return config
+
+    else:
+        try:
+            os.makedirs(os.path.dirname(filename), mode=0o755, exist_ok=True)
+            with open(filename, 'w') as configfile:
+                config.write(configfile)
+            os.chmod(filename, stat.S_IRUSR | stat.S_IWUSR)
+        except Exception as e:
+            raise SystemError(e)
+
+        return True
+
+def gitlab_login(session, location, username=None, password=None):
+
+    try:
+        response = session.get(location['url'], params=location['query'], allow_redirects=False)
+    except Exception as e:
+        raise SystemError(e)
+
+    #If location has users/sign_in (private_token not working now...)
+    location = location_parse(response.headers['location'])
+    if location['path'].find('users/sign_in'):
+        try:
+            response = session.get(location['url'], params=location['query'], allow_redirects=False)
+        except Exception as e:
+            raise SystemError(e)
+        
+        #tree = html.fromstring(response.content)
+        #raise SystemExit(tree.xpath('//form[@id="new_user"]/input[@name="authenticity_token"]'))
+        m = re.search('.*name="authenticity_token" value="([^"]+)"', response.text)
+        if m:
+            authenticity_token = m.group(1)
+        else:
+            raise SystemExit('Unable to find authenticity_token')
+
+        data = {
+            "user[login]": username,
+            "user[password]": password,
+            "user[remember_me]": 0,
+            "authenticity_token": authenticity_token
+        }
+        try:
+            response = session.post(location['url'], data=data, allow_redirects=False)
+        except Exception as e:
+            raise SystemError(e)
+
+        if 'Invalid Login or password.' in response.text:
+            raise SystemExit('Gitlab login incorrect!')
+
+        if 'location' not in response.headers:
+            raise SystemExit('Failed to login on gitlab')
+        location = location_parse(response.headers['location'])
+
+    #Process callback location from gitlab
+    try:
+        response = session.get(location['url'], params=location['query'], allow_redirects=False)
+    except Exception as e:
+        raise SystemError(e)
+    
+    if 'location' in response.headers:
+        return session, location_parse(response.headers['location'])
+    elif 'to use your account' in response.text:
+        raise SystemExit('You need to authorize Kyma Application on Gitlab first! Go to: %s' % response.url)
+        #return gitlab_authorize_kyma(session, response)
+
+def gitlab_authorize_kyma(session, location):
+    # If Kyma is not authorized to use OpenID for the user
+    
+        #tree = html.fromstring(response.content)
+    #raise SystemExit(tree.xpath('//div[@class='theme-))
+    return None
+
+def main():
+    # Main Function
+
+    openid_configuration = {}
+    jwks = {}
+    aud = [
+        'kyma-client',
+        'console'
+    ]
+
+    #Load config file
+    args = args_parse()
+    config = config_parse(args)
+    context = context_get_set()
+
+    #Create request session
+    session = requests.Session()
+    
+    #Get OpenID configuration from dex
+    try:
+        response = session.get("%s/.well-known/openid-configuration" % config[context]['dex'], allow_redirects=False)
+    except Exception as e:
+        raise SystemError(e)
+
+    if response.status_code != 200:
+        raise SystemExit('Error getting OpenID configuration!')
+
+    openid_configuration['openid'] = json.loads(response.text)
+
+    #Get jwks configuration from dex
+    try:
+        response = session.get(openid_configuration['openid']['jwks_uri'], allow_redirects=False)
+    except Exception as e:
+        raise SystemError(e)
+
+    if response.status_code != 200:
+        raise SystemExit('Error getting jwks!')
+
+    jwks['jwks'] = json.loads(response.text)
+
+    #Get req value from dex
+    state = secrets.token_hex(16)
+    nonce = secrets.token_hex(16)
+
+    query = {
+        "client_id": "console",
+        "redirect_uri": config[context]['console'],
+        "response_type": ' '.join(openid_configuration['openid']['response_types_supported']),
+        "scope": "audience:server:client_id:kyma-client audience:server:client_id:console %s " % ' '.join(openid_configuration['openid']['scopes_supported']),
+        "state" : state,
+        "nonce": nonce
+        }
+
+    try:
+        response = session.get(openid_configuration['openid']['authorization_endpoint'], params=query, allow_redirects=False)
+    except Exception as e:
+        raise SystemError(e)
+
+    m = re.search('href="/auth/.*req=([^"]+)".*', response.text)
+    if m:
+        req = m.group(1)
+    else:
+        raise SystemExit("Failed to get req value")
+
+    if config[context]['login'] == 'gitlab':
+        #Continue with gitlab login and get authenticity_token from dex
+        query = {
+            "req": req,
+        }
+        try:
+            response = session.get(openid_configuration['openid']['authorization_endpoint'] + '/gitlab', params=query, allow_redirects=False)
+        except Exception as e:
+            raise SystemError(e)
+
+        #location has gitlab oauth url do login
+        l = location_parse(response.headers['location'])
+        session, l = gitlab_login(session, l, config[context]['username'], password_get_set(context, config[context]['username']))
+
+    if "/callback" not in l['url']:
+        raise SystemExit('No callback in url!')
+
+    #location has callback uri
+    try:
+        response = session.get(l['url'], params=l['query'], allow_redirects=False)
+    except Exception as e:
+        raise SystemError(e)
+
+    l = location_parse(response.headers['location'])
+    if "/approval" not in l['url']:
+        raise SystemExit('No approval in url!')
+
+    #location has approval uri
+    if req not in l['query']['req']:
+        raise SystemExit('Original dex req not equals to callback req!')
+    
+    try:
+        response = session.get(config[context]['dex'] + l['url'], params=l['query'], allow_redirects=False)
+    except Exception as e:
+        raise SystemError(e)
+
+    #location has kyma access_token
+    l = location_parse(response.headers['location'])
+    headers = {
+        "authorization": "%s %s" % (''.join(l['fragment']['token_type']).capitalize(), ''.join(l['fragment']['access_token']))
+    }
+    session.headers.update(headers)
+    try:
+        response = session.get(config[context]['configurations-generator'] + '/kube-config')
+    except Exception as e:
+        raise SystemError(e)
+
+    if response.status_code != 200:
+        raise SystemExit('Error donwloading kubeconfig')
+
+    try:
+        kubeconfig = yaml.safe_load(response.text)
+    except Exception as e:
+        raise SystemError(e)
+    
+    #Decode JWT
+    public_keys = {}
+    algorithms = {}
+    for jwk in jwks['jwks']['keys']:
+        kid = jwk['kid']
+        public_keys[kid] = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+        algorithms[kid] = jwk['alg']
+
+    #Process cluster/context/user from speficied context and change username in kubeconfig
+    for cl in kubeconfig['clusters']:
+        if cl['name'] != context:
+            del cl
+
+    for co in kubeconfig['contexts']:
+        if co['name'] == context:
+            user = co['context']['user']
+            #Rename user context from OIDCUser to context name
+            co['context']['user'] = context
+        else:
+            del co
+
+    for us in kubeconfig['users']:
+        if us['name'] == user:
+            #Get current token
+            token = us['user']['token']
+            del us['user']['token']
+            
+            #Rename user from OIDCUser to context name
+            us['name'] = context
+
+            #Get header and keys from token
+            kid = jwt.get_unverified_header(token)['kid']
+            key = public_keys[kid]
+            alg = algorithms[kid]
+
+            #Decode token with keys
+            token_decoded = jwt.decode(token, key=key, algorithms=alg, audience=aud)
+
+            #Get expiry datetime
+            token_expiry = datetime.fromtimestamp(token_decoded['exp'], timezone.utc)
+            
+            #Add auth-provider to kubeconfig like gcp
+            us['user'].update({ 'auth-provider': { 'name':'cgp', 'config': { 'access-token': token , 'cmd-path': me('realpath'), 'expiry': token_expiry.isoformat().replace('+00:00','Z'), 'expiry-key': '{.credential.token_expiry}', 'token-key': '{.credential.access_token}'} } })
+
+            #Old exec that doesn't use kubectl cache
+            #u['user'].update({ 'exec': { 'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': me } })
+            break
+        else:
+            del us
+
+    kubectl_result = kubectl_config('view -o jsonpath=\'{.contexts[?(@.name=="%s")]}\'' % context, ignore_error=True)
+
+    if kubectl_result.returncode != 0 or not kubectl_result.stdout.strip('\'"'):
+        print('Context %s not found in kubeconfig. Saving it!' % context)
+        args.kubeconfig = True
+
+    if args.kubeconfig:
+        kubeconfig_save(context, kubeconfig)
+        print('Kyma Kubeconfig for %s saved!' % context)
+        sys.exit(os.EX_OK)
+
+    authentication = { }
+    authentication.update({ "credential": {}})
+    authentication['credential'].update({ "access_token": token })
+    authentication['credential'].update({ "token_expiry": token_expiry.isoformat().replace('+00:00','Z')})
+
+    if config[context]['format'] == 'json':
+        print (json.dumps(authentication))
+    elif config[context]['format'] == 'yaml':
+        print(yaml.dump(authentication))
+    
+    sys.exit(os.EX_OK)
+
+if __name__ == '__main__':
+    main()

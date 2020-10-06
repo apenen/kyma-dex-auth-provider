@@ -1,0 +1,6 @@
+keyring
+pyjwt
+pyyaml
+requests
+pyopenssl
+secrets
