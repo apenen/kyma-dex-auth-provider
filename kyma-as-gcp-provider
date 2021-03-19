@@ -440,6 +440,9 @@ def main():
         except Exception as e:
             raise SystemError(e)
 
+        if 400 <= response.status_code < 500:
+            raise SystemExit('No gitlab login enabled in DEX!')
+
         #location has gitlab oauth url do login
         l = location_parse(response.headers['location'])
         session, l = gitlab_login(session, l, config[context]['username'], password_get_set(context, config[context]['username']))
