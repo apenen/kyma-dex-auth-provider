@@ -26,7 +26,6 @@ import yaml
 
 from datetime import datetime, timezone
 from getpass import getpass
-from lxml import html
 
 class CatchSigint(object):
     '''SIGINT Capture'''
@@ -79,7 +78,7 @@ def password_get_set(context, username, password=None):
     return passwd
 
 def kubectl_config(arguments, ignore_error=False):
-    
+
     if not shutil.which('kubectl'):
         raise SystemExit('kubectl not found!')
 
@@ -110,13 +109,18 @@ def kubeconfig_save(name, kubeconfig):
 
     #Config user
     kubectl_config('unset users.%s' % name)
-    for i in user[0]['auth-provider']['config']:
-        command = 'set-credentials %s --auth-provider gcp --auth-provider-arg=%s=%s' % (name, i, user[0]['auth-provider']['config'][i])
-        kubectl_config(command)
+    # for i in user[0]['auth-provider']['config']:
+    #     command = 'set-credentials %s --auth-provider gcp --auth-provider-arg=%s=%s' % (name, i, user[0]['auth-provider']['config'][i])
+    #     kubectl_config(command)
+
+    command = 'set-credentials {} --exec-api-version {} --exec-command {}'.format(name, user[0]['exec']['apiVersion'], user[0]['exec']['command'])
+    kubectl_config(command)
+    command = 'set-credentials {} --exec-arg={}'.format(name, ' --exec-arg='.join(user[0]['exec']['args']))
+    kubectl_config(command)
 
     return
 
-def keyring_get_save(context, id, password=None):
+def keyring_get_save(context, id, password=None, token=None):
 
     if not password:
         try:
@@ -278,7 +282,7 @@ def config_parse(args):
         if 'last_use' in config[context]:
             #Removed old use
             config.remove_option(context, 'last_use')
-        config[context]['modificated'] = datetime.now(timezone.utc).astimezone().isoformat()
+        config[context]['modificated'] = datetime.now().isoformat()
         config_load_save(filename, config)
         if args.save:
             raise SystemExit('Configuration updated!')
@@ -305,6 +309,21 @@ def config_load_save(filename, config=None):
             raise SystemError(e)
 
         return True
+
+def expired(check_date):
+    try:
+        return datetime.now().isoformat()>check_date
+    except Exception:
+        return True
+
+def print_authentication(token, token_expiry, output_format):
+    authentication = {}
+    authentication.update({ "apiVersion": "client.authentication.k8s.io/v1beta1", "kind": "ExecCredential", "status": { "token": token, "expirationTimestamp": token_expiry }})
+
+    if output_format == 'json':
+        print (json.dumps(authentication))
+    elif output_format == 'yaml':
+        print(yaml.dump(authentication))
 
 def gitlab_login(session, location, username=None, password=None):
 
@@ -380,6 +399,10 @@ def main():
     args = args_parse()
     config = config_parse(args)
     context = context_get_set()
+
+    if not args.kubeconfig and 'token_expiry' in config[context] and not expired(config[context]['token_expiry']):
+        print_authentication(config[context]['access_token'], config[context]['token_expiry'], config[context]['format'])
+        sys.exit(os.EX_OK)
 
     #Create request session
     session = requests.Session()
@@ -530,10 +553,8 @@ def main():
             token_expiry = datetime.fromtimestamp(token_decoded['exp'], timezone.utc)
             
             #Add auth-provider to kubeconfig like gcp
-            us['user'].update({ 'auth-provider': { 'name':'cgp', 'config': { 'access-token': token , 'cmd-path': me('realpath'), 'expiry': token_expiry.isoformat().replace('+00:00','Z'), 'expiry-key': '{.credential.token_expiry}', 'token-key': '{.credential.access_token}'} } })
-
-            #Old exec that doesn't use kubectl cache
-            #u['user'].update({ 'exec': { 'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': me } })
+            # us['user'].update({ 'auth-provider': { 'name':'cgp', 'config': { 'access-token': token , 'cmd-path': me('realpath'), 'expiry': token_expiry.isoformat().replace('+00:00','Z'), 'expiry-key': '{.credential.token_expiry}', 'token-key': '{.credential.access_token}'} } })
+            us['user'].update({ 'exec': { 'command': me('realpath'), 'apiVersion': 'client.authentication.k8s.io/v1beta1', 'args': [ '--context', context ] } })
             break
         else:
             del us
@@ -549,16 +570,13 @@ def main():
         print('Kyma Kubeconfig for %s saved!' % context)
         sys.exit(os.EX_OK)
 
-    authentication = { }
-    authentication.update({ "credential": {}})
-    authentication['credential'].update({ "access_token": token })
-    authentication['credential'].update({ "token_expiry": token_expiry.isoformat().replace('+00:00','Z')})
+    config[context]['access_token'] = token
+    config[context]['token_expiry'] = token_expiry.isoformat()
 
-    if config[context]['format'] == 'json':
-        print (json.dumps(authentication))
-    elif config[context]['format'] == 'yaml':
-        print(yaml.dump(authentication))
-    
+    config_load_save(config_file(args), config)
+
+    print_authentication(token, token_expiry.isoformat(), config[context]['format'])
+
     sys.exit(os.EX_OK)
 
 if __name__ == '__main__':

@@ -4,4 +4,3 @@ pyyaml
 requests
 pyopenssl
 secrets
-lxml
