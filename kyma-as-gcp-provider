@@ -170,7 +170,7 @@ def args_parse():
     parser.add_argument('-u', '--username', '--user', help='username to login in', dest='username', default=None)
     parser.add_argument('-p', '--password', '--pass', help='prompt for new password', dest='password', action='store_true', default=False)
     parser.add_argument('-s', '--save', help='save %s login credentials' % me('filename'), dest='save', action='store_true', default=False)
-    parser.add_argument('-t', '--type', help='set credentials type', dest='credentials_type', action='store', type=str)
+    parser.add_argument('-t', '--type', help='set credentials type', dest='credentials_type', action='store', type=str, default='ExecCredential')
 
     kubectl_group_parser = parser.add_argument_group('kubectl')
     kubectl_group_parser.add_argument('-k', '--kubeconfig', help='save kubeconfig from kyma', dest='kubeconfig', action='store_true', default=False)
@@ -340,8 +340,14 @@ def print_authentication(token, token_expiry, output_format, credentials_type):
     elif output_format == 'yaml':
         print(yaml.dump(authentication))
 
-def gitlab_login(session, location, username=None, password=None):
+def get_window_location(response):
+    matched = re.match(r'.*?window\.location\s*=\s*\"([^"]+)\"', response, re.M|re.S)
+    if(matched and "http" in matched.group(1)):
+        return matched.group(1)
+    else:
+        return None
 
+def gitlab_login(session, location, username=None, password=None):
     try:
         response = session.get(location['url'], params=location['query'], allow_redirects=False)
     except Exception as e:
@@ -386,12 +392,15 @@ def gitlab_login(session, location, username=None, password=None):
         response = session.get(location['url'], params=location['query'], allow_redirects=False)
     except Exception as e:
         raise SystemError(e)
-    
+
     if 'location' in response.headers:
         return session, location_parse(response.headers['location'])
     elif 'to use your account' in response.text:
         raise SystemExit('You need to authorize Kyma Application on Gitlab first! Go to: %s' % response.url)
         #return gitlab_authorize_kyma(session, response)
+    elif 'window.location=' in response.text:
+        #For gitlab 14 support.
+        return session, location_parse(get_window_location(response.text))
 
 def gitlab_authorize_kyma(session, location):
     # If Kyma is not authorized to use OpenID for the user
