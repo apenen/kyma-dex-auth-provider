@@ -92,7 +92,7 @@ def kubectl_config(arguments, ignore_error=False):
 
     return result
 
-def kubeconfig_save(name, kubeconfig, credentials_type):
+def kubeconfig_save(name, kubeconfig):
     cluster = [ cl['cluster'] for cl in kubeconfig['clusters'] if cl['name'] == name ]
     context = [ co['context'] for co in kubeconfig['contexts'] if co['name'] == name ]
     user = [ us['user'] for us in kubeconfig['users'] if us['name'] == name ]
@@ -109,12 +109,9 @@ def kubeconfig_save(name, kubeconfig, credentials_type):
 
     #Config user
     kubectl_config('unset users.%s' % name)
-    if credentials_type == "ExecCredential":
-        kubectl_config('set-credentials {} --exec-api-version {} --exec-command {}'.format(name, user[0]['exec']['apiVersion'], user[0]['exec']['command']))
-        kubectl_config('set-credentials {} --exec-arg={}'.format(name, ' --exec-arg='.join(user[0]['exec']['args'])))
-    else:
-        for i in user[0]['auth-provider']['config']:
-            kubectl_config('set-credentials %s --auth-provider gcp --auth-provider-arg=%s=%s' % (name, i, user[0]['auth-provider']['config'][i]))
+    kubectl_config('set-credentials {} --exec-api-version {} --exec-command {}'.format(name, user[0]['exec']['apiVersion'], user[0]['exec']['command']))
+    kubectl_config('set-credentials {} --exec-arg={}'.format(name, ' --exec-arg='.join(user[0]['exec']['args'])))
+
 
     return
 
@@ -170,7 +167,6 @@ def args_parse():
     parser.add_argument('-u', '--username', '--user', help='username to login in', dest='username', default=None)
     parser.add_argument('-p', '--password', '--pass', help='prompt for new password', dest='password', action='store_true')
     parser.add_argument('-s', '--save', help='save %s login credentials' % me('filename'), dest='save', action='store_true')
-    parser.add_argument('-t', '--type', help='set credentials type', dest='credentials_type', action='store', type=str, default='ExecCredential')
     parser.add_argument('--force-renew', help='force token renew', dest='force_renew', action='store_true')
 
     kubectl_group_parser = parser.add_argument_group('kubectl')
@@ -202,7 +198,7 @@ def context_get_set(args=None, current=False):
     
     return context
 
-def config_file(args):
+def config_file(args, old = False):
     if args.filename:
         filename = args.filename
     else:
@@ -252,9 +248,6 @@ def config_parse(args):
     if args.configurations_generator:
         config[context]['configurations-generator'] = args.configurations_generator
 
-    if args.credentials_type:
-        config[context]['type'] = args.credentials_type
-
     if config[context]['login'] == 'gitlab':
         if 'username' not in config[context]:
             raise SystemExit('User required for %s login!' % config[context]['login'])
@@ -280,10 +273,7 @@ def config_parse(args):
 
     if not 'format' in config[context]:
         config[context]['format'] = args.format
-    
-    if not 'type' in config[context]:
-        config[context]['type'] = args.credentials_type
-
+ 
     if args.save or save:
         if 'last_use' in config[context]:
             #Removed old use
@@ -301,7 +291,11 @@ def config_load_save(filename, config=None):
         try:
             config.read(filename)
         except Exception as e:
-            raise SystemError(e)
+            #Added to try to get old name configuration
+            try:
+                config.read(filename.replace(me('filename'), 'kyma-as-gcp-provider'))
+            except Exception as e:
+                raise SystemError(e)
 
         return config
 
@@ -329,15 +323,10 @@ def expired(check_date, force_renew):
 
     return has_expired
 
-def print_authentication(token, token_expiry, output_format, credentials_type):
+def print_authentication(token, token_expiry, output_format):
     authentication = { }
-    if credentials_type == "ExecCredential":
-        authentication = {}
-        authentication.update({ "apiVersion": "client.authentication.k8s.io/v1beta1", "kind": "ExecCredential", "status": { "token": token, "expirationTimestamp": token_expiry }})
-    else:
-        authentication.update({ "credential": {}})
-        authentication['credential'].update({ "access_token": token })
-        authentication['credential'].update({ "token_expiry": token_expiry })
+
+    authentication.update({ "apiVersion": "client.authentication.k8s.io/v1beta1", "kind": "ExecCredential", "status": { "token": token, "expirationTimestamp": token_expiry }})
     
     if output_format == 'json':
         print (json.dumps(authentication))
@@ -429,7 +418,7 @@ def main():
     context = context_get_set()
 
     if not args.kubeconfig and 'token_expiry' in config[context] and not expired(config[context]['token_expiry'], args.force_renew):
-        print_authentication(config[context]['access_token'], config[context]['token_expiry'], config[context]['format'], config[context]['type'])
+        print_authentication(config[context]['access_token'], config[context]['token_expiry'], config[context]['format'])
         sys.exit(os.EX_OK)
 
     #Create request session
@@ -581,11 +570,8 @@ def main():
             token_expiry = datetime.fromtimestamp(token_decoded['exp'], timezone.utc)
             
             #Add auth-provider to kubeconfig like 
-            if config[context]['type'] == "ExecCredential":
-                us['user'].update({ 'exec': { 'command': me('realpath'), 'apiVersion': 'client.authentication.k8s.io/v1beta1', 'args': [ '--context', context ] } })
-            else:
-                us['user'].update({ 'auth-provider': { 'name':'cgp', 'config': { 'access-token': token , 'cmd-path': me('realpath'), 'expiry': token_expiry.isoformat().replace('+00:00','Z'), 'expiry-key': '{.credential.token_expiry}', 'token-key': '{.credential.access_token}'} } })
-            
+            us['user'].update({ 'exec': { 'command': me('realpath'), 'apiVersion': 'client.authentication.k8s.io/v1beta1', 'args': [ '--context', context ] } })
+
             break
         else:
             del us
@@ -597,7 +583,7 @@ def main():
         args.kubeconfig = True
 
     if args.kubeconfig:
-        kubeconfig_save(context, kubeconfig, config[context]['type'])
+        kubeconfig_save(context, kubeconfig)
         print('Kyma Kubeconfig for %s saved!' % context)
         sys.exit(os.EX_OK)
 
@@ -606,7 +592,7 @@ def main():
 
     config_load_save(config_file(args), config)
 
-    print_authentication(token, token_expiry.isoformat(), config[context]['format'], config[context]['type'])
+    print_authentication(token, token_expiry.isoformat(), config[context]['format'])
 
     sys.exit(os.EX_OK)
 
