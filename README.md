@@ -1,4 +1,4 @@
-# Kyma Token as GCP Auth-Provider
+# Kyma Dex Auth-Provider
 
 This script helps cluster users to auto-update kyma token to their configuration/cache.
 
@@ -17,7 +17,7 @@ Put this script in the bin path you prefer:
 Install the requirements with (pip3): pip3 install -r requirements.txt
 
 ## First use: (if wanna use current-context from kubectl omit context argument)
-    kyma-as-gcp-provider -c context -u gitlab_username
+    kyma-dex-auth-provider -c context -u gitlab_username
 
 1. Will ask for password
 2. Adds context to kubectl if not exists
@@ -32,14 +32,17 @@ Packages with apt/yum:
     python3-ldap
 Requirements file requirements.txt
 
-Config file on: ~/.config/kyma-as-gcp-provider/config
+Config file on: ~/.config/kyma-dex-auth-provider/config
 
 
 ## Force save kyma kubeconfig to your kubectl config file
-kyma-as-gcp-provider -k
+kyma-dex-auth-provider -k
 
 ## Force password change (ask for it!):
-kyma-as-gcp-provider -p
+kyma-dex-auth-provider -p
 
 ## To save configuration changes use --save:
-kyma-as-gcp-provider -u newuser -p --save
+kyma-dex-auth-provider -u newuser -p --save
+
+## Force token renew if cluster reinstalled before token expiration
+kyma-dex-auth-provider --force-renew

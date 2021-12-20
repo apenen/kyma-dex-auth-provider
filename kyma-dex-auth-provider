@@ -168,9 +168,10 @@ def args_parse():
     parser.add_argument('--format', choices=['json', 'yaml'], help='output format (json, yaml)', dest='format', default='json')
     parser.add_argument('-l', '--login', choices=[ 'gitlab' ], help='login system to use', dest='login', default='gitlab')
     parser.add_argument('-u', '--username', '--user', help='username to login in', dest='username', default=None)
-    parser.add_argument('-p', '--password', '--pass', help='prompt for new password', dest='password', action='store_true', default=False)
-    parser.add_argument('-s', '--save', help='save %s login credentials' % me('filename'), dest='save', action='store_true', default=False)
+    parser.add_argument('-p', '--password', '--pass', help='prompt for new password', dest='password', action='store_true')
+    parser.add_argument('-s', '--save', help='save %s login credentials' % me('filename'), dest='save', action='store_true')
     parser.add_argument('-t', '--type', help='set credentials type', dest='credentials_type', action='store', type=str, default='ExecCredential')
+    parser.add_argument('--force-renew', help='force token renew', dest='force_renew', action='store_true')
 
     kubectl_group_parser = parser.add_argument_group('kubectl')
     kubectl_group_parser.add_argument('-k', '--kubeconfig', help='save kubeconfig from kyma', dest='kubeconfig', action='store_true', default=False)
@@ -315,13 +316,16 @@ def config_load_save(filename, config=None):
 
         return True
 
-def expired(check_date):
+def expired(check_date, force_renew):
     has_expired = True
 
     try:
         has_expired = datetime.now().isoformat()>check_date
     except Exception:
         pass
+    
+    if force_renew:
+        has_expired = True
 
     return has_expired
 
@@ -424,7 +428,7 @@ def main():
     config = config_parse(args)
     context = context_get_set()
 
-    if not args.kubeconfig and 'token_expiry' in config[context] and not expired(config[context]['token_expiry']):
+    if not args.kubeconfig and 'token_expiry' in config[context] and not expired(config[context]['token_expiry'], args.force_renew):
         print_authentication(config[context]['access_token'], config[context]['token_expiry'], config[context]['format'], config[context]['type'])
         sys.exit(os.EX_OK)
 
