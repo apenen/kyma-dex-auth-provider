@@ -198,7 +198,7 @@ def context_get_set(args=None, current=False):
     
     return context
 
-def config_file(args, old = False):
+def config_file(args):
     if args.filename:
         filename = args.filename
     else:
