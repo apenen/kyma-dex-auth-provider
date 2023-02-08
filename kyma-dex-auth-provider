@@ -138,6 +138,12 @@ def hostname_resolves(hostname):
     except socket.error:
         return False
 
+def clean_query(query):
+    new_query = {}
+    for q in query:
+        new_query[q.replace("amp;", "")] = query[q]
+    return new_query
+
 def location_parse(location):
     from urllib.parse import urlparse, parse_qs
     result = {}
@@ -149,7 +155,7 @@ def location_parse(location):
     result['hostname'] = l.hostname
     result['port'] = l.port
     result['path'] = l.path
-    result['query'] = parse_qs(l.query)
+    result['query'] = clean_query(parse_qs(l.query, ))
     result['fragment'] = parse_qs(l.fragment)
 
     return result
@@ -340,6 +346,13 @@ def get_window_location(response):
     else:
         return None
 
+def get_href(response):
+    matched = re.match(r'.*?href=\s*\"([^"]+)\"', response, re.M|re.S)
+    if(matched and "https" in matched.group(1)):
+        return matched.group(1)
+    else:
+        return None
+
 def gitlab_login(session, location, username=None, password=None):
     try:
         response = session.get(location['url'], params=location['query'], allow_redirects=False)
@@ -394,6 +407,8 @@ def gitlab_login(session, location, username=None, password=None):
     elif 'window.location=' in response.text:
         #For gitlab 14 support.
         return session, location_parse(get_window_location(response.text))
+    elif 'href=' in response.text:
+        return session, location_parse(get_href(response.text))
 
 def gitlab_authorize_kyma(session, location):
     # If Kyma is not authorized to use OpenID for the user
