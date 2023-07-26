@@ -4,5 +4,5 @@ pyyaml
 requests
 pyopenssl
 secrets
-certifi>=2023.7.22 # not directly required, pinned by Snyk to avoid a vulnerability
 cryptography>=41.0.2 # not directly required, pinned by Snyk to avoid a vulnerability
+certifi>=2023.7.22 # not directly required, pinned by Snyk to avoid a vulnerability
